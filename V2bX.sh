@@ -938,6 +938,211 @@ open_ports() {
     echo -e "${green}放开防火墙端口成功！${plain}"
 }
 
+
+# 单独添加节点，不覆盖现有节点
+append_node_config() {
+    local config_file="/etc/V2bX/config.json"
+    local backup_file
+    local tmp_file
+    local node_json
+    local core_json
+    local core_name
+    local existing_count
+    local existing_core
+    local api_choice
+
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "缺少 jq，请先执行 apt install -y jq"
+        return 1
+    fi
+
+    if [ ! -f "$config_file" ]; then
+        echo "配置文件不存在，请先生成初始配置"
+        return 1
+    fi
+
+    if ! jq -e '
+        (.Nodes | type == "array") and
+        (.Cores | type == "array")
+    ' "$config_file" >/dev/null; then
+        echo "现有配置无效或缺少 Nodes/Cores 数组"
+        return 1
+    fi
+
+    existing_count=$(jq '.Nodes | length' "$config_file")
+
+    echo "当前已有 ${existing_count} 个节点"
+    jq -r '
+        .Nodes[] |
+        "NodeID: \(.NodeID) | \(.NodeType) | \(.Core)"
+    ' "$config_file"
+
+    echo ""
+    echo "1. 复用现有节点的面板地址和 API Key"
+    echo "2. 输入新的面板地址和 API Key"
+    read -rp "请选择 [1/2]：" api_choice
+
+    case "$api_choice" in
+        1)
+            ApiHost=$(jq -r '.Nodes[0].ApiHost // empty' "$config_file")
+            ApiKey=$(jq -r '.Nodes[0].ApiKey // empty' "$config_file")
+            ;;
+        2)
+            read -rp "请输入面板地址：" ApiHost
+            read -rsp "请输入 API Key：" ApiKey
+            echo
+            ;;
+        *)
+            echo "无效选择"
+            return 1
+            ;;
+    esac
+
+    if [ -z "$ApiHost" ] || [ -z "$ApiKey" ]; then
+        echo "面板地址或 API Key 不能为空"
+        return 1
+    fi
+
+    # 重置核心选择标志，避免上次选择影响本次
+    core_xray=false
+    core_sing=false
+    core_hysteria2=false
+    isreality=""
+    istls=""
+
+    nodes_config=()
+
+    # 复用官方原有节点配置生成函数
+    add_node_config
+
+    if [ "${#nodes_config[@]}" -ne 1 ]; then
+        echo "节点配置生成失败"
+        return 1
+    fi
+
+    # 官方函数生成的 JSON 末尾带有逗号
+    node_json="${nodes_config[0]}"
+    node_json="${node_json%,}"
+
+    if ! echo "$node_json" | jq -e . >/dev/null; then
+        echo "新节点 JSON 无效"
+        return 1
+    fi
+
+    core_name=$(echo "$node_json" | jq -r '.Core')
+
+    # 检查相同面板、核心和 NodeID 是否已经存在
+    if jq -e \
+        --arg host "$ApiHost" \
+        --arg core "$core_name" \
+        --argjson id "$NodeID" \
+        '.Nodes | any(
+            .ApiHost == $host and
+            .Core == $core and
+            .NodeID == $id
+        )' "$config_file" >/dev/null; then
+        echo "节点已经存在，取消添加"
+        return 1
+    fi
+
+    # 判断现有配置是否已经包含该核心
+    existing_core=$(jq -r \
+        --arg core "$core_name" \
+        '.Cores | any(.Type == $core)' \
+        "$config_file")
+
+    core_json='null'
+
+    if [ "$existing_core" != "true" ]; then
+        case "$core_name" in
+            xray)
+                core_json='{
+                    "Type": "xray",
+                    "Log": {
+                        "Level": "error",
+                        "ErrorPath": "/etc/V2bX/error.log"
+                    },
+                    "OutboundConfigPath": "/etc/V2bX/custom_outbound.json",
+                    "RouteConfigPath": "/etc/V2bX/route.json"
+                }'
+                ;;
+            sing)
+                core_json='{
+                    "Type": "sing",
+                    "Log": {
+                        "Level": "error",
+                        "Timestamp": true
+                    },
+                    "NTP": {
+                        "Enable": false,
+                        "Server": "time.apple.com",
+                        "ServerPort": 0
+                    },
+                    "OriginalPath": "/etc/V2bX/sing_origin.json"
+                }'
+                ;;
+            hysteria2)
+                core_json='{
+                    "Type": "hysteria2",
+                    "Log": {
+                        "Level": "error"
+                    }
+                }'
+                ;;
+            *)
+                echo "未知核心类型：$core_name"
+                return 1
+                ;;
+        esac
+    fi
+
+    backup_file="${config_file}.bak.$(date +%Y%m%d_%H%M%S)"
+    tmp_file=$(mktemp /etc/V2bX/config.json.XXXXXX) || return 1
+
+    cp -p "$config_file" "$backup_file" || {
+        rm -f "$tmp_file"
+        return 1
+    }
+
+    # 保留原配置所有其他字段
+    # 只追加 Nodes 和必要的 Cores
+    if ! jq \
+        --argjson node "$node_json" \
+        --argjson core "$core_json" \
+        '
+        .Nodes += [$node] |
+        if $core == null then
+            .
+        else
+            .Cores += [$core]
+        end
+        ' "$config_file" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        echo "写入新配置失败"
+        return 1
+    fi
+
+    if ! jq -e . "$tmp_file" >/dev/null; then
+        rm -f "$tmp_file"
+        echo "新配置校验失败"
+        return 1
+    fi
+
+    chmod --reference="$config_file" "$tmp_file"
+    chown --reference="$config_file" "$tmp_file"
+
+    mv -f "$tmp_file" "$config_file" || return 1
+
+    echo "节点已添加"
+    echo "原配置备份：$backup_file"
+
+    read -rp "是否立即重启 V2bX？(y/N)：" restart_choice
+
+    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
+        v2bx restart
+    fi
+}
+
 show_usage() {
     echo "V2bX 管理脚本使用方法: "
     echo "------------------------------------------"
@@ -951,6 +1156,7 @@ show_usage() {
     echo "V2bX log          - 查看 V2bX 日志"
     echo "V2bX x25519       - 生成 x25519 密钥"
     echo "V2bX generate     - 生成 V2bX 配置文件"
+    echo "V2bX add-node     - 单独添加节点（保留已有节点）"
     echo "V2bX update       - 更新 V2bX"
     echo "V2bX update x.x.x - 安装 V2bX 指定版本"
     echo "V2bX install      - 安装 V2bX"
@@ -985,10 +1191,11 @@ show_menu() {
   ${green}15.${plain} 生成 V2bX 配置文件
   ${green}16.${plain} 放行 VPS 的所有网络端口
   ${green}17.${plain} 退出脚本
+  ${green}18.${plain} 单独添加节点
  "
  #后续更新可加入上方字符串中
     show_status
-    echo && read -rp "请输入选择 [0-17]: " num
+    echo && read -rp "请输入选择 [0-18]: " num
 
     case "${num}" in
         0) config ;;
@@ -1009,7 +1216,8 @@ show_menu() {
         15) generate_config_file ;;
         16) open_ports ;;
         17) exit ;;
-        *) echo -e "${red}请输入正确的数字 [0-16]${plain}" ;;
+        18) check_install && append_node_config ;;
+        *) echo -e "${red}请输入正确的数字 [0-18]${plain}" ;;
     esac
 }
 
@@ -1026,6 +1234,7 @@ if [[ $# > 0 ]]; then
         "update") check_install 0 && update 0 $2 ;;
         "config") config $* ;;
         "generate") generate_config_file ;;
+        "add-node") check_install 0 && append_node_config ;;
         "install") check_uninstall 0 && install 0 ;;
         "uninstall") check_install 0 && uninstall 0 ;;
         "x25519") check_install 0 && generate_x25519_key 0 ;;
