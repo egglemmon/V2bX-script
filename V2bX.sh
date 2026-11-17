@@ -1191,7 +1191,6 @@ show_menu() {
   ${green}15.${plain} 生成 V2bX 配置文件
   ${green}16.${plain} 放行 VPS 的所有网络端口
   ${green}17.${plain} 退出脚本
-  ${green}18.${plain} 单独添加节点
  "
  #后续更新可加入上方字符串中
     show_status
@@ -1216,8 +1215,7 @@ show_menu() {
         15) generate_config_file ;;
         16) open_ports ;;
         17) exit ;;
-        18) check_install && append_node_config ;;
-        *) echo -e "${red}请输入正确的数字 [0-18]${plain}" ;;
+        *) echo -e "${red}请输入正确的数字 [0-16]${plain}" ;;
     esac
 }
 
