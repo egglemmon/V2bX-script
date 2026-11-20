@@ -990,7 +990,7 @@ append_node_config() {
             ;;
         2)
             read -rp "请输入面板地址：" ApiHost
-            read -rsp "请输入 API Key：" ApiKey
+            read -rp "请输入 API Key：" ApiKey
             echo
             ;;
         *)
